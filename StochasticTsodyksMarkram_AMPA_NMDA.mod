@@ -188,6 +188,8 @@ DERIVATIVE odes {
     A_NMDA' = -A_NMDA/tau_r_NMDA
     B_NMDA' = -B_NMDA/tau_d_NMDA
     Use' = -Use/tau_facil
+    A = R * Use
+    R= R-Use*R
 }
 : Block to be executed for a pre-synaptic spike event
 NET_RECEIVE (weight, tsyn (ms)) {
