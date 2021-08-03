@@ -1,7 +1,8 @@
 COMMENT
 /**
  * @file TsodyksMarkram_AMPA_NMDA.mod
- * @brief An AMPA and NMDA glutamate receptor model with Tsodyks-Markram dynamics of the releasible pool
+ * @brief An AMPA and NMDA glutamate receptor model with short-term depression
+ * and facilitation
  * @author emuller
  * @date 2017-05-11
  * @remark Copyright © BBP/EPFL 2005-2014; All rights reserved. 
@@ -9,46 +10,26 @@ COMMENT
 ENDCOMMENT
 
 
-TITLE AMPA and NMDA glutamate receptor with Stochastic Tsodyks-Markram dynamics
+TITLE AMPA and NMDA glutamate receptor with TM short-term dynamics
 
 COMMENT
 AMPA and NMDA glutamate receptor conductance using a dual-exponential profile
-and with stochastic Tsodyks-Markram dynamics of the releasible pool.
-
-This new model is based on Fuhrmann et al. 2002, and has the following properties:
-
-1) No consumption on failure.  
-2) No release just after release until recovery.
-3) Same ensemble averaged trace as deterministic/canonical Tsodyks-Markram 
-   using same parameters determined from experiment.
-
-The synapse is implemented as a uni-vesicular (generalization to
-multi-vesicular should be straight-forward) 2-state Markov process.
-The states are {1=recovered, 0=unrecovered}.
-
-For a pre-synaptic spike or external spontaneous release trigger
-event, the synapse will only release if it is in the recovered state,
-and with probability Use (which follows facilitation dynamics).  If it
-releases, it will transition to the unrecovered state.  Recovery is as
-a Poisson process with rate 1/tau_rec.
-
+and incorporating Tsodyks-Markram short-term dynamics
 ENDCOMMENT
 
 : Definition of variables which may be accesses by the user 
 NEURON {
     THREADSAFE
 
-    POINT_PROCESS StochasticTsodyksMarkram_AMPA_NMDA
+    POINT_PROCESS TsodyksMarkram_AMPA_NMDA
     RANGE tau_r_AMPA, tau_d_AMPA
     RANGE tau_r_NMDA, tau_d_NMDA
     RANGE mg, gmax_AMPA, gmax_NMDA
-    RANGE i, i_AMPA, i_NMDA, g_AMPA, g_NMDA, g, e
     RANGE tau_rec, tau_facil, U1
+    RANGE i, i_AMPA, i_NMDA, g_AMPA, g_NMDA, g, e
     NONSPECIFIC_CURRENT i
-
-    : For user defined random number generator
-    POINTER rng
 }
+
 
 : Definition of constants which may be set by the user
 PARAMETER {
@@ -65,11 +46,10 @@ PARAMETER {
     gmax_AMPA = .001   (uS)  : Weight conversion factor (from nS to uS)
     gmax_NMDA = .001   (uS)  : Weight conversion factor (from nS to uS)
 
-    : Parameters for Tsodyks-Markram (TM) model of vesicle pool dynamics
-    tau_rec = 600      (ms)  : time constant of vesicle pool recovery
-    tau_facil = 10     (ms)  : time constant of release facilitation relaxation
-    U1 = 0.5           (1)   : release probability in the absence of facilitation
-
+    : Parameters of TM model
+    tau_rec = 200      (ms)  : time constant of recovery from depression
+    tau_facil = 200    (ms)  : time constant of facilitation
+    U1 = 0.5           (1)   : baseline release probability
 }
 
 : Declaration of state variables 
@@ -87,24 +67,10 @@ STATE {
     B_NMDA       : NMDA state variable to construct the dual-exponential profile
                  : decay kinetics with tau_d_NMDA
 
-    : State variables for TM model
-    Use          : running release probability
-
+: State variables for the TM model
+    R            : Running fraction of available vesicles
+    Use          : Running value of the release probability
 }
-
-: This is "inline" code in the C programming language 
-: needed to manage user defined random number generators
-VERBATIM
-
-#include<stdlib.h>
-#include<stdio.h>
-#include<math.h>
-
-double nrn_random_pick(void* r);
-void* nrn_random_arg(int argpos);
-
-ENDVERBATIM
-
 
 : Declaration of variables that are computed, e.g. in the BREAKPOINT block
 ASSIGNED {
@@ -117,8 +83,6 @@ ASSIGNED {
     g (uS)
     factor_AMPA
     factor_NMDA
-    rng
-    R : running fraction of vesicle pool
 }
 
 : Definition of initial conditions
@@ -187,84 +151,21 @@ DERIVATIVE odes {
     B_AMPA' = -B_AMPA/tau_d_AMPA
     A_NMDA' = -A_NMDA/tau_r_NMDA
     B_NMDA' = -B_NMDA/tau_d_NMDA
+
+    R' = (1-R)/tau_rec
     Use' = -Use/tau_facil
-    A = R * Use
-    R= R-Use*R
 }
+
 : Block to be executed for a pre-synaptic spike event
-NET_RECEIVE (weight, tsyn (ms)) {
-    LOCAL A, result, Psurv
-    INITIAL{
-        tsyn=t
-    }
-    Use = Use + U1*(1-Use) : Update of release probability 
-    if (R == 0) {
-        : probability of survival of unrecovered state based on Poisson recovery with rate 1/tau_rec
-        Psurv = exp(-(t-tsyn)/tau_rec)
-        result = urand()
-        if (result>Psurv) {
-            : recover      
-            R = 1     
-        }
-        else {
-            : probability of survival must now be from this interval
-	    tsyn = t
-        }
-    }	   
-	   
-    if (R == 1) {
-        result = urand()
-        if (result<Use) {
-	    : release!
-   	    tsyn = t
-	    R = 0
-            A_AMPA = A_AMPA + weight*factor_AMPA
-            B_AMPA = B_AMPA + weight*factor_AMPA
-            A_NMDA = A_NMDA + weight*factor_NMDA
-            B_NMDA = B_NMDA + weight*factor_NMDA
-        }
-    }
-}
-: Black magic to support use defined random number generators
-: No user serviceable code below this point
-PROCEDURE setRNG() {
-VERBATIM
-    {
-        /**
-         * This function takes a NEURON Random object declared in hoc and makes it usable by this mod file.
-         * Note that this method is taken from Brett paper as used by netstim.hoc and netstim.mod
-         * which points out that the Random must be in uniform(1) mode
-         */
-        void** pv = (void**)(&_p_rng);
-        if( ifarg(1)) {
-            *pv = nrn_random_arg(1);
-        } else {
-            *pv = (void*)0;
-        }
-    }
-ENDVERBATIM
-}
-FUNCTION urand() {
-VERBATIM
-        double value;
-        if (_p_rng) {
-                /*
-                :Supports separate independent but reproducible streams for
-                : each instance. However, the corresponding hoc Random
-                : distribution MUST be set to Random.uniform(0,1)
-                */
-                value = nrn_random_pick(_p_rng);
-                //printf("random stream for this simulation = %lf\n",value);
-                return value;
-        }else{
-ENDVERBATIM
-                : the old standby. Cannot use if reproducible parallel sim
-                : independent of nhost or which host this instance is on
-                : is desired, since each instance on this cpu draws from
-                : the same stream
-                value = scop_random(1)
-VERBATIM
-        }
-ENDVERBATIM
-        urand = value
+NET_RECEIVE (weight) {
+    LOCAL A
+    
+    Use = Use + U1*(1-Use)
+    A = Use*R
+    R = R - A
+    
+    A_AMPA = A_AMPA + A*weight*factor_AMPA
+    B_AMPA = B_AMPA + A*weight*factor_AMPA
+    A_NMDA = A_NMDA + A*weight*factor_NMDA
+    B_NMDA = B_NMDA + A*weight*factor_NMDA
 }
